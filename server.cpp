@@ -1,3 +1,4 @@
+#include <assert.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,7 +13,14 @@ static void msg(const char *msg);
 
 static void die(const char *msg);
 
-static void do_something(int connfd);
+static int32_t read_full(int fd, char *buf, size_t n);
+
+static int32_t write_all(int fd, const char *buf, size_t n);
+
+static int32_t one_request(int connfd);
+
+// Maximum msg length
+const size_t k_max_msg = 4096;
 
 int main() {
     // Creates a new TCP/IP socket
@@ -79,11 +87,16 @@ int main() {
             continue;
         }
 
-        // Handle the client connection
-        do_something(connfd);
-        // Closes the fie descriptor terminating the connection
+        // Only serves one client connection at once
+        while(true) {
+            int32_t err = one_request(connfd);
+            if (err) {
+                break;
+            }
+        }
         close(connfd);
     }
+    return 0;
 }
 
 static void msg(const char *msg) {
@@ -96,28 +109,105 @@ static void die(const char *msg) {
     abort();
 }
 
-// Handles communication with a client
-static void do_something(int connfd) {
+// Read complete buffer
+static int32_t read_full(int fd, char *buf, size_t n) {
     /*
-        Receives a message from the client
-        Displays it on the server side
-        Sends a fixed response ("world") back to the client
+        Ensures all requested bytes are raed from a file descriptor.
+        Handles the common case where a single read() call might not 
+        return all requested bytes.
     */
+    // Reading while checking if there are still bytes to read
+    while (n > 0) {
+        // Reads up to n bytes from fd into buffer
+        ssize_t rv = read(fd, buf, n);
+        // Error
+        if (rv <= 0) {
+            return -1;
+        }
 
-    // Buffer to recieve data from the client
-    char rbuf[64] = {};
-    // Reads up to 63 bytes from the client connection
-    ssize_t n = read(connfd, rbuf, sizeof(rbuf) - 1);
-    // Error handeling
-    if (n < 0) {
-        msg("read() error");
-        return;
+        // Verifies the condition and terminates if false
+        assert((size_t)rv <= n);
+
+        // Buffer Management
+        n -= (size_t)rv;
+        buf += rv;
     }
-    // Displays client message
-    printf("Client says: %s\n", rbuf);
+    return 0;
+}
 
-    // Responds with the message "world" to the client
-    char wbuf[] = "world";
-    write(connfd, wbuf, strlen(wbuf));
+// Attempts to write a complete buffer
+static int32_t write_all(int fd, const char *buf, size_t n) {
+    /*
+        Ensures all requested bytes are written to a file descriptor.
+        Handles the common case where a single write() call might not 
+        write all requested bytes.
+    */
+    while (n > 0) {
+        // Write up to n bytes from buffer to fd
+        ssize_t rv = write(fd, buf, n);
+        // Error
+        if (rv <= 0) {
+            return -1;
+        }
+        assert((size_t)rv <= n);
+        // Buffer management
+        n -= (size_t)rv;
+        buf += rv;
+    }
+    return 0;
+}
+
+// Handles a single client request
+static int32_t one_request(int connfd) {
+    /*
+        Handle variable-length messages by prefixing each message with its length, 
+        allowing the receiver to know exactly how many bytes to read for the complete message.
+    */
+    // Declares buffer
+    char rbuf[4 + k_max_msg]; // Size of buffer
+    // Stores error codes
+    errno = 0;
+    // Read exaclty 4 bytes
+    int32_t err = read_full(connfd, rbuf, 4);
+    // Error
+    if (err) {
+        msg(errno == 0 ? "EOF" : "read() error");
+        return err;
+    }
+
+    uint32_t len = 0;
+    // Function to copy memory
+    // Assume little endian
+    memcpy(&len, rbuf, 4); // Destination, source, byte count
+    // Length validation
+    if (len > k_max_msg) {
+        msg("too long");
+        return -1;
+    }
+
+    // Reading message body after header
+    err = read_full(connfd, &rbuf[4], len);
+    // Error
+    if (err) {
+        msg("read() error");
+        return err;
+    }
+
+    // Processing Message
+    fprintf(stderr, "Client says: %.*s\n", len, &rbuf[4]);
+
+    // Preparing Response
+    const char reply[] = "world";
+    // Buffer size
+    char wbuf[4 + sizeof(reply)];
+    // Length of reply string
+    len = (uint32_t)strlen(reply);
+
+    // Building Response
+    memcpy(wbuf, &len, 4); // Copy lenght to first 4 bytes of buffer
+    memcpy(&wbuf[4], reply, len); // Coppy reply after header
+
+    // Sending Response
+    return write_all(connfd, wbuf, 4 + len);
 }
 
